@@ -1,0 +1,1583 @@
+---
+title: "One Grid. Very Different Operating Profiles."
+subtitle: "A look at British Columbia's electricity capacity and generation, 2005–2016"
+author: "Drishtant Shrivastava"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    self_contained: true
+---
+
+<style>
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  color: #202124;
+  line-height: 1.58;
+}
+h1, h2, h3 {
+  color: #202124;
+  font-weight: 700;
+}
+h1 {
+  margin-top: 1.45em;
+}
+h2 {
+  margin-top: 1.3em;
+  border-bottom: 1px solid #E8EAED;
+  padding-bottom: 0.25em;
+}
+p {
+  max-width: 900px;
+}
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin: 24px 0 30px 0;
+}
+.metric-card {
+  background: #F8F9FA;
+  border: 1px solid #E8EAED;
+  border-radius: 12px;
+  padding: 18px 18px 16px 18px;
+}
+.metric-value {
+  display: block;
+  font-size: 28px;
+  font-weight: 750;
+  color: #202124;
+  line-height: 1.1;
+}
+.metric-label {
+  display: block;
+  margin-top: 6px;
+  color: #5F6368;
+  font-size: 14px;
+}
+.callout {
+  border-left: 4px solid #255A8A;
+  background: #F8F9FA;
+  padding: 14px 18px;
+  margin: 22px 0;
+  border-radius: 0 10px 10px 0;
+}
+.note {
+  color: #5F6368;
+  font-size: 0.94em;
+}
+.source-box {
+  background: #F8F9FA;
+  border: 1px solid #E8EAED;
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin: 18px 0;
+}
+table {
+  font-size: 0.95em;
+}
+@media (max-width: 780px) {
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>
+
+```{r setup, include=FALSE}
+required_packages <- c(
+  "tidyverse",
+  "ggrepel",
+  "scales",
+  "patchwork",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Missing required R package(s): ",
+      paste(missing_packages, collapse = ", "),
+      ". Install them with install.packages(c(",
+      paste(sprintf('"%s"', missing_packages), collapse = ", "),
+      ")) and knit again."
+    ),
+    call. = FALSE
+  )
+}
+
+library(tidyverse)
+library(ggrepel)
+library(scales)
+library(patchwork)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.retina = 2,
+  out.width = "100%"
+)
+
+options(scipen = 999)
+```
+
+# Why I looked at this
+
+I started this project after reading about the fragility and complexity of northern electricity systems. It made me curious about a deceptively simple question closer to home:
+
+> **When a province has electricity-generating capacity available, how much of that capacity is actually used — and how does that differ by source?**
+
+Installed capacity and electricity generation answer two different questions. **Capacity** describes how much power infrastructure can produce at a point in time, while **generation** measures how much energy it actually produced over a period.
+
+I wanted to bring those two datasets together and examine British Columbia (because I live here!) through the lens of **capacity factor**: annual generation relative to the theoretical maximum output of installed capacity.
+
+This report is deliberately reproducible. It downloads the source files from the web every time it is knitted, validates the response and schema, and **stops with an explicit error** if a required dataset cannot be retrieved or is empty.
+
+# Data provenance
+
+The underlying data are published by the **Canada Energy Regulator (CER)** through the Government of Canada's Open Government Portal as *Electricity generation and capacity in Canada*. The record covers all provinces and territories, eight generation sources, and annual observations from 2005 through 2016. For this B.C. analysis, I exclude solar because the dataset reports installed solar capacity but no measurable annual generation at the reported GWh precision during the period.
+
+<div class="source-box">
+
+**Government of Canada catalogue record:**  
+<https://open.canada.ca/data/en/dataset/2cdf43fc-d4aa-4604-9f21-29777d955810>
+
+**Generation resource page:**  
+<https://open.canada.ca/data/en/dataset/2cdf43fc-d4aa-4604-9f21-29777d955810/resource/b751e0dc-1a00-417a-9f04-b4777adb521f>
+
+**Capacity resource page:**  
+<https://open.canada.ca/data/en/dataset/2cdf43fc-d4aa-4604-9f21-29777d955810/resource/2971c342-94e7-416b-8e61-02c64c532708>
+
+</div>
+
+The Government of Canada catalogue currently points to the CER-hosted CSV files below. The report fetches those files directly rather than relying on local copies.
+
+```{r source-urls}
+generation_url <- paste0(
+  "https://www.cer-rec.gc.ca/open/energy/",
+  "electricity-generation-dataset.csv"
+)
+
+capacity_url <- paste0(
+  "https://www.cer-rec.gc.ca/open/energy/",
+  "electricity-capacity-dataset.csv"
+)
+
+source_lookup <- tibble(
+  Dataset = c("Generation", "Capacity"),
+  `Official CSV` = c(generation_url, capacity_url)
+)
+
+knitr::kable(source_lookup)
+```
+
+
+The current CER CSVs expose the raw fields `Region`, `Source`, `Year`, `Data`, and `Unit`. The ingestion step below immediately maps `Data` to `Capacity` or `Generated` so all downstream analysis uses one consistent schema.
+
+# Reproducible web ingestion with fail-fast validation
+
+The published CSV files use the generic fields `Data` and `Unit`. To keep the web-based report consistent with my working analysis, I standardize those fields immediately after download:
+
+- capacity data → `Capacity`
+- generation data → `Generated`
+
+That means the rest of the report uses the same naming convention as the exploratory R workflow rather than switching between multiple schemas.
+
+The loader below deliberately **fails fast**. If the web file cannot be downloaded, is empty, no longer contains the expected CER fields, has the wrong unit, or contains duplicate Region–Source–Year keys, knitting stops with an explicit error.
+
+```{r web-ingestion}
+load_cer_csv <- function(
+  url,
+  dataset_name,
+  expected_unit,
+  value_name
+) {
+
+  temp_csv <- tempfile(
+    fileext = ".csv"
+  )
+
+  on.exit(
+    unlink(temp_csv),
+    add = TRUE
+  )
+
+  # ------------------------------------------------------------
+  # 1. Download
+  # ------------------------------------------------------------
+
+  download_result <- tryCatch(
+
+    utils::download.file(
+      url = url,
+      destfile = temp_csv,
+      mode = "wb",
+      quiet = TRUE
+    ),
+
+    error = function(e) {
+
+      stop(
+        paste0(
+          dataset_name,
+          " could not be downloaded from the web.\n\n",
+          "URL: ",
+          url,
+          "\n\nUnderlying error: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+    }
+  )
+
+  if (
+    is.numeric(download_result) &&
+    length(download_result) == 1 &&
+    !is.na(download_result) &&
+    download_result != 0
+  ) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " download returned a non-zero status (",
+        download_result,
+        ").\nURL: ",
+        url
+      ),
+      call. = FALSE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 2. Confirm a non-empty file exists
+  # ------------------------------------------------------------
+
+  if (!file.exists(temp_csv)) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " was not found after the download attempt.\nURL: ",
+        url
+      ),
+      call. = FALSE
+    )
+  }
+
+  downloaded_size <- file.info(
+    temp_csv
+  )$size
+
+  if (
+    is.na(downloaded_size) ||
+    downloaded_size <= 0
+  ) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " returned an empty file.\nURL: ",
+        url
+      ),
+      call. = FALSE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 3. Parse CSV
+  # ------------------------------------------------------------
+
+  raw_data <- tryCatch(
+
+    readr::read_csv(
+      temp_csv,
+      show_col_types = FALSE,
+      progress = FALSE
+    ),
+
+    error = function(e) {
+
+      stop(
+        paste0(
+          dataset_name,
+          " was downloaded, but could not be parsed as CSV.\n\n",
+          "Underlying error: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+    }
+  )
+
+  # ------------------------------------------------------------
+  # 4. Validate current CER web schema
+  # ------------------------------------------------------------
+
+  required_columns <- c(
+    "Region",
+    "Source",
+    "Year",
+    "Data",
+    "Unit"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(raw_data)
+  )
+
+  if (length(missing_columns) > 0) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " schema has changed.\n\n",
+        "Missing expected column(s): ",
+        paste(
+          missing_columns,
+          collapse = ", "
+        ),
+        "\n\nColumns found: ",
+        paste(
+          names(raw_data),
+          collapse = ", "
+        )
+      ),
+      call. = FALSE
+    )
+  }
+
+  # The capacity CSV currently contains blank trailing rows.
+  # Remove rows that are not actual observations.
+  raw_data <- raw_data |>
+    dplyr::filter(
+      !is.na(Region),
+      !is.na(Source),
+      !is.na(Year),
+      !is.na(Data)
+    )
+
+  if (nrow(raw_data) == 0) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " was downloaded, but contains no usable observations."
+      ),
+      call. = FALSE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 5. Validate unit
+  # ------------------------------------------------------------
+
+  observed_units <- raw_data |>
+    dplyr::distinct(Unit) |>
+    dplyr::pull(Unit)
+
+  if (
+    length(observed_units) != 1 ||
+    observed_units[[1]] != expected_unit
+  ) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " contains an unexpected unit.\n",
+        "Expected: ",
+        expected_unit,
+        "\nObserved: ",
+        paste(
+          observed_units,
+          collapse = ", "
+        )
+      ),
+      call. = FALSE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 6. Validate join keys
+  # ------------------------------------------------------------
+
+  duplicate_keys <- raw_data |>
+    dplyr::count(
+      Region,
+      Source,
+      Year
+    ) |>
+    dplyr::filter(
+      n > 1
+    )
+
+  if (nrow(duplicate_keys) > 0) {
+
+    stop(
+      paste0(
+        dataset_name,
+        " contains duplicate Region–Source–Year records. ",
+        "The join is no longer one-to-one."
+      ),
+      call. = FALSE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 7. Standardize to the field names used in my working code
+  # ------------------------------------------------------------
+
+  clean_data <- raw_data |>
+    dplyr::transmute(
+      Region = as.character(Region),
+      Source = as.character(Source),
+      Year = as.integer(Year),
+      value = as.numeric(Data)
+    )
+
+  names(clean_data)[
+    names(clean_data) == "value"
+  ] <- value_name
+
+  message(
+    "✓ ",
+    dataset_name,
+    " loaded: ",
+    format(
+      nrow(clean_data),
+      big.mark = ","
+    ),
+    " observations."
+  )
+
+  clean_data
+}
+
+
+capacity <- load_cer_csv(
+  url = capacity_url,
+  dataset_name = "Electricity capacity",
+  expected_unit = "MW",
+  value_name = "Capacity"
+)
+
+generation <- load_cer_csv(
+  url = generation_url,
+  dataset_name = "Electricity generation",
+  expected_unit = "GW.h",
+  value_name = "Generated"
+)
+```
+
+The two standardized tables now mirror the convention used in my working analysis:
+
+```{r validate-and-join}
+expected_capacity_fields <- c(
+  "Region",
+  "Source",
+  "Year",
+  "Capacity"
+)
+
+expected_generation_fields <- c(
+  "Region",
+  "Source",
+  "Year",
+  "Generated"
+)
+
+if (!identical(
+  names(capacity),
+  expected_capacity_fields
+)) {
+
+  stop(
+    paste0(
+      "Capacity field validation failed. Found: ",
+      paste(
+        names(capacity),
+        collapse = ", "
+      )
+    ),
+    call. = FALSE
+  )
+}
+
+if (!identical(
+  names(generation),
+  expected_generation_fields
+)) {
+
+  stop(
+    paste0(
+      "Generation field validation failed. Found: ",
+      paste(
+        names(generation),
+        collapse = ", "
+      )
+    ),
+    call. = FALSE
+  )
+}
+
+
+electricity <- full_join(
+  capacity,
+  generation,
+  by = c(
+    "Region",
+    "Source",
+    "Year"
+  )
+)
+
+
+# A joined observation should normally contain both Capacity and Generated.
+# Stop rather than silently calculate from incomplete pairs.
+
+incomplete_pairs <- electricity |>
+  filter(
+    xor(
+      is.na(Capacity),
+      is.na(Generated)
+    )
+  )
+
+if (nrow(incomplete_pairs) > 0) {
+
+  stop(
+    paste0(
+      "The capacity/generation join produced ",
+      nrow(incomplete_pairs),
+      " incomplete Region–Source–Year pair(s). ",
+      "Review the source data before continuing."
+    ),
+    call. = FALSE
+  )
+}
+
+
+# Optional audit table
+join_audit <- tibble(
+  Dataset = c(
+    "Capacity",
+    "Generation",
+    "Joined"
+  ),
+  Rows = c(
+    nrow(capacity),
+    nrow(generation),
+    nrow(electricity)
+  )
+)
+
+knitr::kable(
+  join_audit,
+  caption = "Web-data ingestion audit"
+)
+```
+
+# Method: calculating capacity factor
+
+For each Region–Source–Year observation:
+
+\[
+\text{Capacity Factor} =
+\frac{\text{Annual Generation (MWh)}}
+{\text{Installed Capacity (MW)} \times \text{Hours in Year}}
+\times 100
+\]
+
+Because the source generation data are in GWh, I multiply generation by 1,000 to convert GWh to MWh. I also use **8,784 hours in leap years** rather than assuming 8,760 hours for every year.
+
+Capacity factor is an **utilization measure**, not a measure of engineering, economic, or environmental efficiency.
+
+```{r capacity-factor}
+electricity <- electricity |>
+  mutate(
+    Leap_Year =
+      Year %% 400 == 0 |
+      (
+        Year %% 4 == 0 &
+        Year %% 100 != 0
+      ),
+
+    Hours_In_Year = if_else(
+      Leap_Year,
+      8784,
+      8760
+    ),
+
+    Capacity_Factor = if_else(
+      Capacity > 0 &
+        !is.na(Generated),
+
+      (
+        Generated * 1000
+      ) /
+        (
+          Capacity *
+            Hours_In_Year
+        ) *
+        100,
+
+      NA_real_
+    )
+  )
+```
+
+# Focus: British Columbia
+
+```{r bc-filter}
+bc <- electricity |>
+  filter(
+    Region == "BC",
+    Source != "Solar"
+  )
+
+expected_sources <- c(
+  "Hydro",
+  "Wind",
+  "Biomass",
+  "Nuclear",
+  "Coal",
+  "Natural Gas",
+  "Oil and Diesel"
+)
+
+missing_bc_sources <- setdiff(
+  expected_sources,
+  unique(bc$Source)
+)
+
+if (nrow(bc) == 0) {
+
+  stop(
+    "British Columbia was not found in the downloaded data.",
+    call. = FALSE
+  )
+}
+
+if (length(missing_bc_sources) > 0) {
+
+  stop(
+    paste0(
+      "British Columbia data are missing expected source(s): ",
+      paste(
+        missing_bc_sources,
+        collapse = ", "
+      )
+    ),
+    call. = FALSE
+  )
+}
+
+bc <- bc |>
+  group_by(Year) |>
+  mutate(
+    Total_Generation =
+      sum(
+        Generated,
+        na.rm = TRUE
+      ),
+
+    Generation_Share = if_else(
+      Total_Generation > 0,
+      Generated /
+        Total_Generation *
+        100,
+      NA_real_
+    )
+  ) |>
+  ungroup()
+```
+
+```{r helper-functions, include=FALSE}
+value_for <- function(source, year, variable) {
+
+  result <- bc |>
+    filter(
+      Source == source,
+      Year == year
+    ) |>
+    pull({{ variable }})
+
+  if (length(result) != 1 || is.na(result)) {
+    stop(
+      paste0(
+        "Expected exactly one non-missing value for ",
+        source,
+        " in ",
+        year,
+        "."
+      ),
+      call. = FALSE
+    )
+  }
+
+  result
+}
+
+pct1 <- function(x) {
+  scales::number(
+    x,
+    accuracy = 0.1,
+    suffix = "%"
+  )
+}
+
+num0 <- function(x) {
+  scales::number(
+    x,
+    accuracy = 1,
+    big.mark = ","
+  )
+}
+
+hydro_share_2016 <- value_for(
+  "Hydro",
+  2016,
+  Generation_Share
+)
+
+biomass_share_2016 <- value_for(
+  "Biomass",
+  2016,
+  Generation_Share
+)
+
+wind_share_2016 <- value_for(
+  "Wind",
+  2016,
+  Generation_Share
+)
+
+hydro_cf_2016 <- value_for(
+  "Hydro",
+  2016,
+  Capacity_Factor
+)
+
+biomass_cf_2016 <- value_for(
+  "Biomass",
+  2016,
+  Capacity_Factor
+)
+
+wind_cf_2016 <- value_for(
+  "Wind",
+  2016,
+  Capacity_Factor
+)
+
+biomass_cf_2005 <- value_for(
+  "Biomass",
+  2005,
+  Capacity_Factor
+)
+
+biomass_generation_2005 <- value_for(
+  "Biomass",
+  2005,
+  Generated
+)
+
+biomass_generation_2016 <- value_for(
+  "Biomass",
+  2016,
+  Generated
+)
+
+biomass_capacity_2005 <- value_for(
+  "Biomass",
+  2005,
+  Capacity
+)
+
+biomass_capacity_2016 <- value_for(
+  "Biomass",
+  2016,
+  Capacity
+)
+
+wind_capacity_2016 <- value_for(
+  "Wind",
+  2016,
+  Capacity
+)
+
+gas_share_2005 <- value_for(
+  "Natural Gas",
+  2005,
+  Generation_Share
+)
+
+gas_share_2016 <- value_for(
+  "Natural Gas",
+  2016,
+  Generation_Share
+)
+```
+
+<div class="metric-grid">
+  <div class="metric-card">
+    <span class="metric-value">`r pct1(hydro_share_2016)`</span>
+    <span class="metric-label">of B.C. generation came from hydro in 2016</span>
+  </div>
+  <div class="metric-card">
+    <span class="metric-value">`r pct1(biomass_cf_2016)`</span>
+    <span class="metric-label">biomass capacity factor in 2016</span>
+  </div>
+  <div class="metric-card">
+    <span class="metric-value">`r pct1(wind_cf_2016)`</span>
+    <span class="metric-label">wind capacity factor in 2016</span>
+  </div>
+</div>
+
+# 1. One grid, very different operating profiles
+
+I expected hydro to dominate the generation mix. What I did **not** expect was how differently the installed infrastructure was being utilized.
+
+```{r theme, include=FALSE}
+colour_text <- "#202124"
+colour_sub <- "#5F6368"
+colour_grid <- "#E8EAED"
+colour_grey <- "#C9CED3"
+colour_grey_text <- "#7A8087"
+
+focus_colours <- c(
+  "Biomass" = "#2F7D32",
+  "Hydro" = "#255A8A",
+  "Wind" = "#3182BD"
+)
+
+label_colours <- c(
+  focus_colours,
+  "Other" = colour_grey
+)
+
+theme_portfolio <- function(base_size = 12) {
+  theme_minimal(
+    base_size = base_size,
+    base_family = "sans"
+  ) +
+    theme(
+      plot.background =
+        element_rect(
+          fill = "white",
+          color = NA
+        ),
+      panel.background =
+        element_rect(
+          fill = "white",
+          color = NA
+        ),
+      plot.title =
+        element_text(
+          size = 22,
+          face = "bold",
+          color = colour_text,
+          margin = margin(b = 7)
+        ),
+      plot.subtitle =
+        element_text(
+          size = 12,
+          color = colour_sub,
+          lineheight = 1.15,
+          margin = margin(b = 18)
+        ),
+      axis.title =
+        element_text(
+          size = 10.5,
+          face = "bold",
+          color = colour_text
+        ),
+      axis.text =
+        element_text(
+          size = 9.5,
+          color = colour_sub
+        ),
+      panel.grid.minor =
+        element_blank(),
+      panel.grid.major =
+        element_line(
+          color = colour_grid,
+          linewidth = 0.45
+        ),
+      axis.ticks =
+        element_blank(),
+      legend.position =
+        "none",
+      plot.caption =
+        element_text(
+          size = 8.8,
+          color = colour_grey_text,
+          hjust = 0,
+          lineheight = 1.15,
+          margin = margin(t = 14)
+        )
+    )
+}
+```
+
+```{r capacity-factor-trend, fig.width=11, fig.height=6.5}
+focus_sources <- c(
+  "Biomass",
+  "Hydro",
+  "Wind"
+)
+
+background_df <- bc |>
+  filter(
+    !Source %in% focus_sources,
+    !is.na(Capacity_Factor)
+  )
+
+focus_df <- bc |>
+  filter(
+    Source %in% focus_sources,
+    !is.na(Capacity_Factor)
+  )
+
+end_labels <- bc |>
+  filter(!is.na(Capacity_Factor)) |>
+  group_by(Source) |>
+  slice_max(
+    Year,
+    n = 1,
+    with_ties = FALSE
+  ) |>
+  ungroup() |>
+  mutate(
+    Label_Group = if_else(
+      Source %in% focus_sources,
+      Source,
+      "Other"
+    ),
+    End_Label = if_else(
+      Source %in% focus_sources,
+      paste0(
+        Source,
+        "  ",
+        scales::number(
+          Capacity_Factor,
+          accuracy = 0.1,
+          suffix = "%"
+        )
+      ),
+      Source
+    )
+  )
+
+p_capacity <- ggplot() +
+
+  geom_line(
+    data = background_df,
+    aes(
+      x = Year,
+      y = Capacity_Factor,
+      group = Source
+    ),
+    color = colour_grey,
+    linewidth = 0.7,
+    alpha = 0.85
+  ) +
+
+  geom_line(
+    data = focus_df,
+    aes(
+      x = Year,
+      y = Capacity_Factor,
+      group = Source,
+      color = Source,
+      linetype = Source
+    ),
+    linewidth = 1.3
+  ) +
+
+  geom_point(
+    data = end_labels,
+    aes(
+      x = Year,
+      y = Capacity_Factor,
+      color = Label_Group
+    ),
+    size = 2.7
+  ) +
+
+  geom_text_repel(
+    data = end_labels,
+    aes(
+      x = Year,
+      y = Capacity_Factor,
+      label = End_Label,
+      color = Label_Group
+    ),
+    direction = "y",
+    hjust = 0,
+    nudge_x = 0.38,
+    size = 3.7,
+    fontface = "bold",
+    segment.color = NA,
+    box.padding = 0.22,
+    point.padding = 0.1,
+    max.overlaps = Inf
+  ) +
+
+  annotate(
+    "segment",
+    x = 2009.15,
+    xend = 2010,
+    y = 8,
+    yend = 14,
+    color = colour_sub,
+    linewidth = 0.4
+  ) +
+
+  annotate(
+    "text",
+    x = 2008.9,
+    y = 5.5,
+    label = "Wind enters the mix",
+    hjust = 0.99,
+    size = 3.3,
+    fontface = "bold",
+    color = colour_text
+  ) +
+
+  annotate(
+    "segment",
+    x = 2014.2,
+    xend = 2015,
+    y = 76,
+    yend = 84.5,
+    color = colour_sub,
+    linewidth = 0.4
+  ) +
+
+  annotate(
+    "text",
+    x = 2012.55,
+    y = 76,
+    label = "Biomass utilization\nsurges",
+    hjust = 0,
+    size = 3.3,
+    fontface = "bold",
+    color = colour_text
+  ) +
+
+  scale_color_manual(
+    values = label_colours
+  ) +
+
+  scale_linetype_manual(
+    values = c(
+      "Biomass" = "solid",
+      "Hydro" = "dashed",
+      "Wind" = "longdash"
+    )
+  ) +
+
+  scale_x_continuous(
+    breaks = c(
+      2005,
+      2007,
+      2009,
+      2011,
+      2013,
+      2015
+    ),
+    limits = c(
+      2005,
+      2017.35
+    ),
+    expand = c(0, 0)
+  ) +
+
+  scale_y_continuous(
+    labels = label_percent(scale = 1),
+    breaks = seq(
+      0,
+      100,
+      20
+    ),
+    limits = c(
+      0,
+      100
+    ),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title =
+      "One grid. Very different operating profiles.",
+
+    subtitle =
+      paste0(
+        "Annual capacity factor by generation source, 2005–2016. ",
+        "Biomass utilization climbed sharply while hydro stayed comparatively stable."
+      ),
+
+    x = NULL,
+
+    y =
+      "Annual capacity factor",
+
+    caption =
+      paste0(
+        "Capacity factor = annual generation ÷ theoretical maximum annual generation. ",
+        "Source: Canada Energy Regulator"
+      )
+  ) +
+
+  guides(
+    color = "none",
+    linetype = "none"
+  ) +
+
+  theme_portfolio() +
+
+  theme(
+    panel.grid.major.x =
+      element_blank(),
+    plot.margin =
+      margin(
+        20,
+        95,
+        15,
+        20
+      )
+  )
+
+p_capacity
+```
+
+The standout is **biomass**. Its calculated capacity factor rises from `r pct1(biomass_cf_2005)` in 2005 to `r pct1(biomass_cf_2016)` in 2016. Over the same period, installed biomass capacity rises from `r num0(biomass_capacity_2005)` MW to `r num0(biomass_capacity_2016)` MW, while annual biomass generation rises from `r num0(biomass_generation_2005)` GWh to `r num0(biomass_generation_2016)` GWh.
+
+That distinction matters. The story is not simply that B.C. built more biomass capacity. The data suggest that the available biomass fleet was being used **much more intensively** by the end of the period.
+
+Wind tells a different story. It begins appearing in the provincial dataset in 2009, reaches `r num0(wind_capacity_2016)` MW of installed capacity by 2016, and records a `r pct1(wind_cf_2016)` capacity factor that year.
+
+Hydro is less dramatic in capacity-factor terms, but that should not be interpreted as under-performance. Reservoir hydro has operational value that a simple annual utilization ratio does not capture: water storage gives system operators flexibility over **when** electricity is generated.
+
+<div class="callout">
+<strong>Important:</strong> capacity factor is not efficiency. A lower capacity factor can reflect resource availability, dispatch strategy, reserve value, maintenance, market conditions, or the physical characteristics of the technology.
+</div>
+
+Secondary research helps explain these patterns. CER's 2016 review says four B.C. wind farms were built between 2009 and 2014, most under the BC Hydro Standing Offer Program. The same report links biomass expansion to the 2008 B.C. Bioenergy Strategy and subsequent BC Hydro bioenergy and biomass procurement. It also notes that large hydro reservoirs can act as storage and backup for variable wind output.
+
+# 2. Utilization is not the same as importance to the grid
+
+A source can have a high capacity factor without supplying a large share of total electricity.
+
+That is especially visible in 2016.
+
+```{r scatter-data}
+scatter_2016 <- bc |>
+  filter(
+    Year == 2016,
+    !is.na(Capacity_Factor),
+    !is.na(Generation_Share)
+  ) |>
+  mutate(
+    Category = case_when(
+      Source == "Hydro" ~ "Hydro",
+      Source == "Biomass" ~ "Biomass",
+      Source == "Wind" ~ "Wind",
+      TRUE ~ "Other"
+    )
+  )
+
+scatter_colours <- c(
+  "Hydro" = "#255A8A",
+  "Biomass" = "#2F7D32",
+  "Wind" = "#3182BD",
+  "Other" = "#B8BEC5"
+)
+```
+
+```{r generation-share-vs-utilization, fig.width=12, fig.height=6.8}
+p_full <- ggplot(
+  scatter_2016,
+  aes(
+    x = Generation_Share,
+    y = Capacity_Factor
+  )
+) +
+
+  geom_point(
+    aes(color = Category),
+    size = 5,
+    alpha = 0.98
+  ) +
+
+  geom_text_repel(
+    aes(
+      label = Source,
+      color = Category
+    ),
+    size = 3.5,
+    fontface = "bold",
+    segment.color = "#BFC3C7",
+    segment.linewidth = 0.35,
+    box.padding = 0.45,
+    point.padding = 0.3,
+    max.overlaps = Inf
+  ) +
+
+  scale_color_manual(
+    values = scatter_colours
+  ) +
+
+  scale_x_continuous(
+    labels = label_percent(scale = 1),
+    breaks = c(
+      0,
+      25,
+      50,
+      75,
+      100
+    ),
+    limits = c(
+      -2,
+      100
+    )
+  ) +
+
+  scale_y_continuous(
+    labels = label_percent(scale = 1),
+    breaks = seq(
+      0,
+      100,
+      25
+    ),
+    limits = c(
+      0,
+      100
+    )
+  ) +
+
+  labs(
+    title =
+      "The whole system",
+
+    subtitle =
+      "Hydro dominates electricity supply",
+
+    x =
+      "Share of B.C. generation",
+
+    y =
+      "Annual capacity factor"
+  ) +
+
+  theme_portfolio(10.5) +
+
+  theme(
+    plot.title =
+      element_text(
+        size = 15.5,
+        face = "bold"
+      ),
+    plot.subtitle =
+      element_text(
+        size = 10,
+        margin = margin(b = 12)
+      ),
+    plot.caption =
+      element_blank(),
+    plot.margin =
+      margin(
+        12,
+        10,
+        12,
+        12
+      )
+  )
+
+
+non_hydro_2016 <- scatter_2016 |>
+  filter(Source != "Hydro")
+
+p_zoom <- ggplot(
+  non_hydro_2016,
+  aes(
+    x = Generation_Share,
+    y = Capacity_Factor
+  )
+) +
+
+  geom_point(
+    aes(color = Category),
+    size = 5,
+    alpha = 0.98
+  ) +
+
+  geom_text_repel(
+    aes(
+      label = Source,
+      color = Category
+    ),
+    size = 3.5,
+    fontface = "bold",
+    segment.color = "#BFC3C7",
+    segment.linewidth = 0.35,
+    box.padding = 0.5,
+    point.padding = 0.35,
+    max.overlaps = Inf
+  ) +
+
+  scale_color_manual(
+    values = scatter_colours
+  ) +
+
+  scale_x_continuous(
+    labels = label_percent(scale = 1),
+    breaks = seq(
+      0,
+      10,
+      2
+    ),
+    limits = c(
+      -0.4,
+      11
+    )
+  ) +
+
+  scale_y_continuous(
+    labels = label_percent(scale = 1),
+    breaks = seq(
+      0,
+      100,
+      25
+    ),
+    limits = c(
+      0,
+      100
+    )
+  ) +
+
+  labs(
+    title =
+      "Inside the other 12%",
+
+    subtitle =
+      "Biomass stands out for utilization",
+
+    x =
+      "Share of B.C. generation",
+
+    y = NULL
+  ) +
+
+  theme_portfolio(10.5) +
+
+  theme(
+    plot.title =
+      element_text(
+        size = 15.5,
+        face = "bold"
+      ),
+    plot.subtitle =
+      element_text(
+        size = 10,
+        margin = margin(b = 12)
+      ),
+    axis.text.y =
+      element_blank(),
+    axis.title.y =
+      element_blank(),
+    plot.caption =
+      element_blank(),
+    plot.margin =
+      margin(
+        12,
+        12,
+        12,
+        10
+      )
+  )
+
+p_relationship <- (
+  p_full |
+    p_zoom
+) +
+
+  plot_layout(
+    widths = c(
+      1.1,
+      1
+    )
+  ) +
+
+  plot_annotation(
+    title =
+      "High utilization does not necessarily mean high grid importance",
+
+    subtitle =
+      paste0(
+        "Generation share versus capacity factor in B.C., 2016. ",
+        "The right panel magnifies non-hydro sources without changing the underlying metric."
+      ),
+
+    caption =
+      "Source: Canada Energy Regulator",
+
+    theme =
+      theme(
+        plot.title =
+          element_text(
+            size = 22,
+            face = "bold",
+            color = colour_text
+          ),
+        plot.subtitle =
+          element_text(
+            size = 11.5,
+            color = colour_sub,
+            margin = margin(b = 12)
+          ),
+        plot.caption =
+          element_text(
+            size = 8.8,
+            color = colour_grey_text,
+            hjust = 0
+          )
+      )
+  )
+
+p_relationship
+```
+
+In 2016, biomass operates at a calculated capacity factor of **`r pct1(biomass_cf_2016)`**, but supplies **`r pct1(biomass_share_2016)`** of provincial generation. Hydro operates at a much lower **`r pct1(hydro_cf_2016)`** capacity factor, yet supplies **`r pct1(hydro_share_2016)`** of generation.
+
+That is the central analytical distinction in this project:
+
+> **How intensively infrastructure is used and how important it is to the total grid are not the same thing.**
+
+CER's historical analysis independently reports the same broad 2016 generation mix: hydro at about 88%, biomass at 9%, wind at 1.4%, and natural gas at 1.5%.
+
+# What the secondary research added
+
+The two visual analyses are driven by the downloaded CER data; secondary sources help explain the patterns.
+
+**Hydro as the system backbone.** CER reports that hydro averaged 88.9% of B.C. generation over 2005–2016. Reservoir hydro also provides storage and operational flexibility, which helps explain why capacity factor alone should not be used as a scorecard for the technology.
+
+**Wind's emergence.** CER's 2016 review states that four wind farms were built between 2009 and 2014, most under the BC Hydro Standing Offer Program initiated in 2008.
+
+**Biomass and forestry.** CER links much of B.C.'s biomass generation to wood waste from the forestry and pulp-and-paper sectors. Its 2016 review also points to the 2008 B.C. Bioenergy Strategy and subsequent procurement as important context for the technology's growth.
+
+**Natural gas contraction.** CER's 2017 review records a major drop in natural-gas generation in 2016 and a significant decline in installed gas capacity.
+
+**The remote-grid connection.** CER's current B.C. energy profile notes that refined petroleum products are still used for electricity generation in off-grid communities. That is the next direction I would like to explore: how the provincial grid story differs from remote and northern electricity systems.
+
+# Limitations
+
+This analysis is intentionally descriptive.
+
+1. Capacity factor does **not** measure thermal efficiency, profitability, reliability, emissions, or system value.
+2. Capacity is represented annually; additions or retirements partway through a year can affect the calculated annual factor.
+3. Provincial totals hide plant-level differences.
+4. Reported zero generation can reflect dataset precision or scope.
+5. The data end in 2016, so the charts should be read as a **historical period**, not a description of today's B.C. grid.
+6. The analysis does not model demand, imports/exports, reservoir levels, outages, fuel prices, or dispatch constraints.
+
+# Reproducibility check
+
+```{r data-profile}
+profile <- tibble(
+  Metric = c(
+    "Rows after join",
+    "Regions",
+    "Sources",
+    "First year",
+    "Last year",
+    "B.C. observations"
+  ),
+  Value = c(
+    nrow(electricity),
+    n_distinct(electricity$Region),
+    n_distinct(electricity$Source),
+    min(electricity$Year, na.rm = TRUE),
+    max(electricity$Year, na.rm = TRUE),
+    nrow(bc)
+  )
+)
+
+knitr::kable(profile)
+```
+
+```{r bc-2016-table}
+bc_2016_table <- bc |>
+  filter(
+    Year == 2016
+  ) |>
+  arrange(
+    desc(Generated)
+  ) |>
+  transmute(
+    Source,
+
+    `Capacity (MW)` =
+      round(
+        Capacity,
+        1
+      ),
+
+    `Generation (GWh)` =
+      round(
+        Generated,
+        1
+      ),
+
+    `Capacity factor` =
+      paste0(
+        round(
+          Capacity_Factor,
+          1
+        ),
+        "%"
+      ),
+
+    `Generation share` =
+      paste0(
+        round(
+          Generation_Share,
+          1
+        ),
+        "%"
+      )
+  )
+
+knitr::kable(
+  bc_2016_table,
+  caption =
+    "British Columbia electricity snapshot, 2016"
+)
+```
+
+# Sources and further reading
+
+- **Government of Canada / Canada Energy Regulator.** *Electricity generation and capacity in Canada.*  
+  <https://open.canada.ca/data/en/dataset/2cdf43fc-d4aa-4604-9f21-29777d955810>
+
+- **Canada Energy Regulator.** *Canada's Renewable Power Landscape 2017 — British Columbia.*  
+  <https://www.cer-rec.gc.ca/en/data-analysis/energy-commodities/electricity/report/archive/2017-canadian-renewable-power/province/canadas-renewable-power-landscape-2017-energy-market-analysis-british-columbia.html>
+
+- **Canada Energy Regulator.** *Canada's Renewable Power Landscape 2016 — British Columbia.*  
+  <https://www.cer-rec.gc.ca/en/data-analysis/energy-commodities/electricity/report/archive/2016-canadian-renewable-power/province/canadas-renewable-power-landscape-2016-energy-market-analysis-british-columbia.html>
+
+- **Canada Energy Regulator.** *Provincial and Territorial Energy Profiles — British Columbia.*  
+  <https://www.cer-rec.gc.ca/en/data-analysis/energy-markets/province-territory-energy-profiles/british-columbia.html>
